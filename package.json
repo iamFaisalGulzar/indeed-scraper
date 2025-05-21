@@ -7,6 +7,8 @@
   "dependencies": {
     "@2captcha/captcha-solver": "^1.0.0",
     "dotenv": "^16.5.0",
+    "node-fetch": "^3.3.2",
+    "openai": "^4.100.0",
     "puppeteer": "^22.10",
     "xlsx": "^0.18.5"
   },
