@@ -18,41 +18,136 @@ const openai = new OpenAI({
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
+// ──────────────────────────────────────────────────────────────────────────────
+// PHASE 1.5: Check Skills tags, Licenses, and ignore‐company list
+// ──────────────────────────────────────────────────────────────────────────────
+
+// List of companies to ignore
+const ignore_companies = [
+  "Fidelity Investments",
+  "FIS Global",
+  "EY",
+  "Disney",
+  "Lockheed Martin",
+  "Lockheed Martin Corporation",
+  "Jacobs Engineering Group Inc.",
+  "NTT DATA",
+  "PayPal",
+  "Dialysis Clinic, Inc.",
+  "Discover Financial Services",
+  "Coalition Technologies",
+  "American Partner Solutions",
+  "General Dynamics Information Technology",
+  "Booz Allen",
+  "Amex",
+  "BAE Systems",
+  "Capgemini",
+  "CEDENT",
+  "Infosys",
+  "Peraton",
+  "SAIC",
+  "CVS Health",
+  "Lowe's",
+  "Wipro Limited",
+  "Piper Companies",
+  "Mochi Health",
+  "JPMorganChase",
+  "ECS Federal, LLC",
+  "Disney Entertainment",
+  "Cognizant",
+  "Capital One",
+  "ASRC Federal",
+  "Apple",
+  "Robert Half",
+  "Ebay",
+  "Amazon",
+  "Google/Alpha",
+  "Facebook/Meta",
+  "Microsoft"
+];
+
+// Extract skill tags and licenses from the job details page. Returns an object:
+// { skills: Array<String>, hasLicense: Boolean, companyName: String }
+async function scrapeSkillsAndCheckLicenses(detailPage) {
+  const result = await detailPage.evaluate(() => {
+    // 1) Scrape skill tags. Indeed often uses data‐testid for skill tiles :contentReference[oaicite:1]{index=1}
+    const skillElements = Array.from(
+      document.querySelectorAll('[data-testid*="skill-tile"], .jobCardShelfItem--skill, .job‐tag‐list li')
+    );
+    const skills = skillElements.map(el => el.innerText.trim()).filter(s => s.length > 0);
+
+    // 2) Check for license tiles (e.g., TS/SCI, Secret Clearance, Top Secret) by data‐testid
+    const licenseTiles = Array.from(
+      document.querySelectorAll(
+        '[data-testid*="TS/SCI"], [data-testid*="Secret Clearance"], [data-testid*="Top Secret Clearance"]'
+      )
+    );
+    const hasLicense = licenseTiles.length > 0;
+
+    // 3) Scrape the company name from the detail page header
+    let companyName = "";
+    const compElem = document.querySelector('[data-testid="companyName"], .icl-u-lg-mr--sm');
+    if (compElem) companyName = compElem.innerText.trim();
+
+    return { skills, hasLicense, companyName };
+  });
+
+  return result;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DeepSeek Classification (phase 3 + updated prompt logic)
+// ──────────────────────────────────────────────────────────────────────────────
+
 /**
- * Uses deepseek-chat model to classify a job description.
- * Returns one of: "JS", "PHP", or "Other".
+ * Uses deepseek-chat model to classify a job based on description AND skills array.
+ * Job families:
+ *   • JavaScript-family: JavaScript, TypeScript, Node.js, Nest.js, React, Next.js, Angular, Vue,
+ *       MySQL, SQL, Postgres, Web development, Web design, MongoDB, AWS, Azure, GraphQL, GitHub,
+ *       RestAPI, API's, AJAX, HTML, CSS, Agile, SCRUM, Jira, Debugging, DevOps,
+ *       Linux, Windows, OOP, Docker, XML, Application development, communication skills
+ *   • WordPress-family: WordPress, Webflow, Web development, Web design, Agile, SCRUM, Jira,
+ *       Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills
+ *   • PHP-family: PHP, Laravel, MySQL, SQL, Postgres, MongoDB, Drupal, LAMP Stack, Apache, Git,
+ *       Organizational skills, Web development, Web design, MongoDB, AWS, Azure, GraphQL, GitHub,
+ *       RestAPI, API's, AJAX, HTML, CSS, Agile, SCRUM, Jira, Debugging, DevOps,
+ *       Linux, Windows, OOP, Docker, XML, Application development, communication skills
+ *
+ * RULES:
+ *   1) If the “skills” array contains a majority of tags from exactly one family, choose that family.
+ *   2) If the full “description” (Required Skills, Must Have, Responsibilities) also mentions EXACTLY one family, confirm that family.
+ *   3) If skills and description each indicate different families, or if either mentions >1 family, OR if neither mentions any, return "OTHER".
  */
-/**
- * Uses deepseek-chat model to classify a job description.
- * Checks “Required skills / must-have skills” and tags for our two groups:
- *   • JavaScript-family: JavaScript, Node.js, React, Next.js, Angular, Vue, MySQL, SQL, Postgres, MongoDB 
- *   • PHP-family: PHP, Laravel, WordPress, Webflow
- * If only JavaScript-family keywords are present → “JS”
- * If only PHP-family keywords are present → “PHP”
- * If both families appear OR neither appear → “Other”
- */
-async function classifyDescriptionWithDeepSeek(description) {
-  // Build a system prompt that emphasizes “must-have” or “required skills” context
+async function classifyDescriptionWithDeepSeek(description, skillsArray) {
+  const skillsListStr = skillsArray.join(", ");
+
   const systemPrompt = [
     {
       role: "system",
-      content: 
-        "You are a job-tech classification assistant. " +
-        "Read the full job description (especially looking at any 'Required Skills' or 'Must have' or 'Responsibilities' section, or job tags). " +
-        "There are three families of keywords:\n" +
-        "  • JavaScript-family: JavaScript, Node.js, React, Next.js, Angular, Vue, MySQL, SQL, Postgres, MongoDB\n" +
-        "  • WordPress-family: WordPress, Webflow\n" +
-        "  • PHP-family: PHP, Laravel, MySQL, SQL, Postgres, MongoDB\n\n" +
-        "If the description (in its required-skills or tags or must-have-skills, responsibilities) contains ONLY JavaScript-family keywords, " +
-        "reply exactly: PROFILE: JS. " +
-        "If it contains ONLY WordPress-family keywords, reply exactly: PROFILE: WordPress. " +
-        "If it contains ONLY PHP-family keywords, reply exactly: PROFILE: PHP. " +
-        "If it contains keywords from ALL families or Mix of more than one family, or it has neither, reply exactly: PROFILE: OTHER."
+      content:
+        "You are a job-technology classification assistant. " +
+        "You will receive TWO inputs in the user message:\n\n" +
+        "1) A list of skill tags (comma-separated).\n" +
+        "2) The full job description text (including 'Required Skills', 'Must have', 'Responsibilities', etc.).\n\n" +
+        "There are three families of keywords:\n\n" +
+        "  • JavaScript-family: JavaScript, TypeScript, Node.js, Nest.js, React, Next.js, Angular, Vue, " +
+        "MySQL, SQL, Postgres, Web development, Web design, MongoDB, AWS, Azure, GraphQL, GitHub, RestAPI, API's, AJAX, HTML, CSS, " +
+        "Agile, SCRUM, Jira, Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills\n\n" +
+        "  • WordPress-family: WordPress, Webflow, Web development, Web design, Agile, SCRUM, Jira, " +
+        "Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills\n\n" +
+        "  • PHP-family: PHP, Laravel, MySQL, SQL, Postgres, MongoDB, Drupal, LAMP Stack, Apache, Git, " +
+        "Organizational skills, Web development, Web design, MongoDB, AWS, Azure, GraphQL, GitHub, RestAPI, API's, AJAX, HTML, CSS, " +
+        "Agile, SCRUM, Jira, Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills\n\n" +
+        "RULES:\n" +
+        "1) First, examine SKILLS tags. If a majority belong to one family, that strongly indicates the profile.\n" +
+        "2) Then examine DESCRIPTION sections (Required Skills, Must Have, Responsibilities). If those mention exactly one family, confirm that.\n" +
+        "3) If SKILLS tags point to one family but DESCRIPTION mentions multiple or a different one, or vice versa—and if description + skills mention >1 family, OR if neither mention any—classify as OTHER.\n\n" +
+        "Reply exactly as: PROFILE: JS, PROFILE: WORDPRESS, PROFILE: PHP, or PROFILE: OTHER."
     }
   ];
 
   const userPrompt = [
-    { role: "user", content: description }
+    { role: "user", content: `Skills: ${skillsListStr}\n\nDescription:\n${description}` }
   ];
 
   const response = await openai.chat.completions.create({
@@ -62,9 +157,14 @@ async function classifyDescriptionWithDeepSeek(description) {
 
   const content = response.choices[0].message.content.trim().toUpperCase();
   if (content.includes("PROFILE: JS")) return "JS";
+  if (content.includes("PROFILE: WORDPRESS")) return "WORDPRESS";
   if (content.includes("PROFILE: PHP")) return "PHP";
-  return "Other";
+  return "OTHER";
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Main script: combines all phases + new Title‐check logic
+// ──────────────────────────────────────────────────────────────────────────────
 
 const script = async () => {
   const initialUserAgent = await normalizeUserAgent();
@@ -86,7 +186,7 @@ const script = async () => {
   const injectFile = readFileSync('./inject.js', 'utf8');
   await page.evaluateOnNewDocument(injectFile);
 
-  // CAPTCHA solver setup
+  // PHASE 1: CAPTCHA solving
   let captchaSolvedResolve;
   const captchaSolvedPromise = new Promise(resolve => (captchaSolvedResolve = resolve));
   let sawCaptcha = false;
@@ -107,7 +207,7 @@ const script = async () => {
     }
   });
 
-  // Manual login step if needed
+  // PHASE 2: Manual login (run once if needed)
   const MANUAL_LOGIN_REQUIRED = false;
   if (MANUAL_LOGIN_REQUIRED) {
     await page.goto('https://www.indeed.com/account/login', { waitUntil: 'domcontentloaded' });
@@ -117,29 +217,28 @@ const script = async () => {
     return;
   }
 
-  // Start scraping at initial search URL
-  await page.goto('https://www.indeed.com/jobs?q=software+engineer&l=USA&fromage=1', { waitUntil: 'domcontentloaded' });
-
-  // Wait briefly to see if CAPTCHA runs    
+  // PHASE 3: Navigate to initial search results
+  await page.goto('https://www.indeed.com/jobs?q=php+developer&l=USA&fromage=1', { waitUntil: 'domcontentloaded' });
+  // If no CAPTCHA, resolve immediately
   await wait(3000);
   if (!sawCaptcha) captchaSolvedResolve();
   await captchaSolvedPromise;
 
-  // Manual login allowance
+  // Allow manual login if any login modal appears
   console.log('🔐 If login is prompted, please complete within 30s...');
   await wait(30000);
 
-  // Now begin pagination loop, collecting only “JS” or “PHP” profiles
+  // PHASE 4: Scrape, classify (with Title-check + Phase 1.5 + Phase 3), and export
   const filteredJobs = [];
   let pageIndex = 1;
 
   while (true) {
-    // Wait for at least one job card to appear
+    // Wait for at least one job card
     await page.waitForFunction(() => {
       return document.querySelectorAll('.job_seen_beacon').length > 0;
     }, { timeout: 60000 });
 
-    // Extract basic info + link for each job on current page
+    // Extract basic info + link for each job on this page
     const jobs = await page.evaluate(() => {
       const cards = document.querySelectorAll('.job_seen_beacon');
       return Array.from(cards).map(card => {
@@ -157,41 +256,86 @@ const script = async () => {
 
     console.log(`📄 Page ${pageIndex}: Found ${jobs.length} jobs.`);
 
-    // For each job, open detail, extract full description, classify, and maybe keep
+    // For each job, open detail page and do:
+    //   A) Title-check → if matches React/JavaScript/PHP/WordPress, assign immediately
+    //   B) Otherwise, PHASE 1.5: skills + license + ignore-company
+    //   C) Then PHASE 3: DeepSeek classification
     for (const job of jobs) {
       if (!job.link) continue;
 
-      const detailPage = await browser.newPage();
-      await detailPage.setUserAgent(initialUserAgent);
-      await detailPage.goto(job.link, { waitUntil: 'domcontentloaded' });
+      // Convert title to uppercase for easier substring checks
+      const titleUpper = job.title.toUpperCase();
+      let profileFromTitle = null;
 
-      // Wait for description container
-      await detailPage.waitForSelector('#jobDescriptionText', { timeout: 15000 }).catch(() => {
-        console.warn('⚠️ Description not found for', job.link);
-      });
+      if (titleUpper.includes("REACT") || titleUpper.includes("JAVASCRIPT")) {
+        profileFromTitle = "JS";
+      } else if (titleUpper.includes("PHP")) {
+        profileFromTitle = "PHP";
+      } else if (titleUpper.includes("WORDPRESS")) {
+        profileFromTitle = "WORDPRESS";
+      }
 
-      const fullDescription = await detailPage.evaluate(() => {
-        const d = document.querySelector('#jobDescriptionText');
-        return d ? d.innerText.trim() : "";
-      });
-
-      // Classify using deepseek-chat
-      const profile = await classifyDescriptionWithDeepSeek(fullDescription);
-      await detailPage.close();
-
+      if (profileFromTitle) {
+        // If title gave us an unambiguous family, keep that without DeepSeek
         filteredJobs.push({
           title: job.title,
           company: job.company,
           location: job.location,
           summary: job.summary,
           link: job.link,
-          profile
+          profile: profileFromTitle
         });
+        continue;
+      }
+
+      // If title didn’t match, open detail page for further checks
+      const detailPage = await browser.newPage();
+      await detailPage.setUserAgent(initialUserAgent);
+      await detailPage.goto(job.link, { waitUntil: 'domcontentloaded' });
+
+      // PHASE 1.5a: Scrape skills, licenses, company from detail page
+      const { skills, hasLicense, companyName } = await scrapeSkillsAndCheckLicenses(detailPage);
+
+      // If ANY license tile present → skip job entirely
+      if (hasLicense) {
+        console.log(`⛔ Skipping "${job.title}" because license/security requirement found.`);
+        await detailPage.close();
+        continue;
+      }
+
+      // If company is in ignore list → skip job entirely
+      if (ignore_companies.includes(companyName)) {
+        console.log(`⛔ Skipping "${job.title}" because company "${companyName}" is in ignore list.`);
+        await detailPage.close();
+        continue;
+      }
+
+      // PHASE 1.5b: Extract full description from #jobDescriptionText
+      await detailPage.waitForSelector('#jobDescriptionText', { timeout: 15000 }).catch(() => {
+        console.warn('⚠️ Description container not found for', job.link);
+      });
+      const fullDescription = await detailPage.evaluate(() => {
+        const d = document.querySelector('#jobDescriptionText');
+        return d ? d.innerText.trim() : "";
+      });
+
+      // PHASE 3: Classify with DeepSeek using both description + skills array
+      const profile = await classifyDescriptionWithDeepSeek(fullDescription, skills);
+      await detailPage.close();
+
+      filteredJobs.push({
+        title: job.title,
+        company: job.company,
+        location: job.location,
+        summary: job.summary,
+        link: job.link,
+        profile
+      });
     }
 
-    console.log(`✅ After filtering, kept ${filteredJobs.length} jobs so far.`);
+    console.log(`✅ After processing page ${pageIndex}, total jobs in list: ${filteredJobs.length}`);
 
-    // Attempt to click “Next” for pagination
+    // Pagination: click Next if available
     const nextBtn = await page.$('a[data-testid="pagination-page-next"]');
     if (nextBtn) {
       const disabled = await page.evaluate(el => el.getAttribute('aria-disabled') === 'true', nextBtn);
@@ -199,20 +343,17 @@ const script = async () => {
         console.log('⛔ Next button disabled—last page reached.');
         break;
       }
-
-      console.log('⏭ Moving to next page...');
+      console.log('⏭ Going to next page...');
       await Promise.all([
         page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
         nextBtn.click()
       ]);
 
-      // If Indeed redirects to a login/verification, stop scraping
       const newURL = page.url();
       if (newURL.includes('secure.indeed.com/auth') || newURL.includes('onboarding.indeed.com')) {
-        console.warn('⚠️ Redirected off-job-listings. Stopping.');
+        console.warn('⚠️ Redirected off job listings. Stopping.');
         break;
       }
-
       pageIndex++;
     } else {
       console.log('❌ No Next button—scraping complete.');
@@ -220,7 +361,7 @@ const script = async () => {
     }
   }
 
-  // Write filtered results to Excel, including profile column
+  // Export all filtered jobs (including OTHER profiles) to Excel
   const ws = XLSX.utils.json_to_sheet(filteredJobs);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'FilteredJobs');
@@ -228,8 +369,6 @@ const script = async () => {
 
   console.log(`✅ Finished: ${filteredJobs.length} jobs saved to indeed_filtered_jobs.xlsx`);
   await browser.close();
-}
+};
 
-
-script()
-
+script();
