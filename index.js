@@ -119,42 +119,53 @@ async function scrapeSkillsAndCheckLicenses(detailPage) {
  *   3) If skills and description each indicate different families, or if either mentions >1 family, OR if neither mentions any, return "OTHER".
  */
 async function classifyDescriptionWithDeepSeek(description, skillsArray) {
+  // 1) Convert the scraped skill tags into a comma-separated string
   const skillsListStr = skillsArray.join(", ");
 
+  // 2) Build the system prompt. First look for any “any of the following technologies” line,
+  //    and if found, assign a matching family immediately. Otherwise, fall back to skills + description logic.
   const systemPrompt = [
     {
       role: "system",
       content:
-        "You are a job-technology classification assistant. " +
+        "You are a job‐technology classification assistant. " +
         "You will receive TWO inputs in the user message:\n\n" +
-        "1) A list of skill tags (comma-separated).\n" +
+        "1) A list of skill tags (comma‐separated) scraped from the job’s skill‐tag section.\n" +
         "2) The full job description text (including 'Required Skills', 'Must have', 'Responsibilities', etc.).\n\n" +
-        "There are three families of keywords:\n\n" +
+        "FIRST, look for any sentence like “Experience with any of the following technologies: X, Y, Z, …”. " +
+        "If you see exactly one keyword from the following three families in that sentence, " +
+        "IMMEDIATELY assign that family’s profile and skip Steps TWO and THREE. Otherwise, proceed.\n\n" +
+        "FAMILIES OF KEYWORDS:\n" +
         "  • JavaScript-family: JavaScript, TypeScript, Node.js, Nest.js, React, Next.js, Angular, Vue, " +
-        "MySQL, SQL, Postgres, Web development, Web design, MongoDB, AWS, Azure, GraphQL, GitHub, RestAPI, API's, AJAX, HTML, CSS, " +
-        "Agile, SCRUM, Jira, Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills\n\n" +
-        "  • WordPress-family: WordPress, Webflow, Web development, Web design, Agile, SCRUM, Jira, " +
-        "Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills\n\n" +
+        "MySQL, SQL, Postgres, Web development, Web design, MongoDB, AWS, Azure, Digital Ocean, GraphQL, UI development, GitHub, RestAPI, RESTful API, API's, AJAX, Relational databases, HTML, CSS, Google Cloud Platform, Software development, Databases, Computer science, Git, Visual Studio, Product management, Linux, Responsive web design,, Microsoft SQL Server, Distributed systems, Kubernetes, Terraform, Software troubleshooting, " +
+        "Agile, SCRUM, Jira, Debugging, DevOps, Windows, OOP, Docker, XML, Application development, JavaScript frameworks, communication skills, Microsoft Office, Tailwind CSS, jQuery, MVC \n\n" +
+        "  • WordPress-family: WordPress, Webflow, Web development, Web design, Agile, SCRUM, Jira, Google Cloud Platform, Software development, Databases, Computer science, Git, Visual Studio, Product management, Linux, Responsive web design, Software troubleshooting, " +
+        "Debugging, DevOps, Windows, OOP, Docker, XML, Application development, communication skills  Microsoft Office,\n\n" +
         "  • PHP-family: PHP, Laravel, MySQL, SQL, Postgres, MongoDB, Drupal, LAMP Stack, Apache, Git, " +
-        "Organizational skills, Web development, Web design, MongoDB, AWS, Azure, GraphQL, GitHub, RestAPI, API's, AJAX, HTML, CSS, " +
-        "Agile, SCRUM, Jira, Debugging, DevOps, Linux, Windows, OOP, Docker, XML, Application development, communication skills\n\n" +
+        "Organizational skills, Web development, Web design, MongoDB, AWS, Azure, Digital Ocean, GraphQL, GitHub, RestAPI, RESTful API, API's, AJAX, Relational databases, HTML, CSS, Google Cloud Platform, Software development, Databases, Computer science, Git, Visual Studio, Product management, Microsoft SQL Server, Distributed systems, Kubernetes, Terraform, Software troubleshooting, " +
+        "Agile, SCRUM, Jira, Debugging, DevOps, Linux, Windows, OOP, Database design, Docker, XML, Application development, communication skills, Microsoft Office, Tailwind CSS, jQuery, MVC \n\n" +
         "RULES:\n" +
-        "1) First, examine SKILLS tags. If a majority belong to one family, that strongly indicates the profile.\n" +
-        "2) Then examine DESCRIPTION sections (Required Skills, Must Have, Responsibilities). If those mention exactly one family, confirm that.\n" +
-        "3) If SKILLS tags point to one family but DESCRIPTION mentions multiple or a different one, or vice versa—and if description + skills mention >1 family, OR if neither mention any—classify as OTHER.\n\n" +
+        "STEP TWO (if no clear “any of the following” match):\n" +
+        "  1) Examine the SKILLS LIST. If a majority of tags belong to exactly one family, that strongly indicates that profile.\n" +
+        "  2) Examine DESCRIPTION sections ('Required Skills', 'Must have', 'Responsibilities', etc.). " +
+        "If those sections mention exactly one family, confirm that family.\n" +
+        "  3) If SKILLS tags point to one family but DESCRIPTION mentions multiple families (or vice versa), OR if both mention >1 family, OR if neither mentions any, return OTHER.\n\n" +
         "Reply exactly as: PROFILE: JS, PROFILE: WORDPRESS, PROFILE: PHP, or PROFILE: OTHER."
     }
   ];
 
+  // 3) Combine the user prompt with both the skills string and the full description
   const userPrompt = [
     { role: "user", content: `Skills: ${skillsListStr}\n\nDescription:\n${description}` }
   ];
 
+  // 4) Call the deepseek-chat model
   const response = await openai.chat.completions.create({
     model: "deepseek-chat",
     messages: systemPrompt.concat(userPrompt)
   });
 
+  // 5) Parse the assistant’s single returned message
   const content = response.choices[0].message.content.trim().toUpperCase();
   if (content.includes("PROFILE: JS")) return "JS";
   if (content.includes("PROFILE: WORDPRESS")) return "WORDPRESS";
