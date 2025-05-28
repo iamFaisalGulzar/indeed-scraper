@@ -84,12 +84,7 @@ async function scrapeSkillsAndCheckLicenses(detailPage) {
     );
     const hasLicense = licenseTiles.length > 0;
 
-    // 3) Scrape the company name from the detail page header
-    let companyName = "";
-    const compElem = document.querySelector('[data-testid="companyName"], .icl-u-lg-mr--sm');
-    if (compElem) companyName = compElem.innerText.trim();
-
-    return { skills, hasLicense, companyName };
+    return { skills, hasLicense };
   });
 
   return result;
@@ -305,7 +300,7 @@ const script = async () => {
       await detailPage.goto(job.link, { waitUntil: 'domcontentloaded' });
 
       // PHASE 1.5a: Scrape skills, licenses, company from detail page
-      const { skills, hasLicense, companyName } = await scrapeSkillsAndCheckLicenses(detailPage);
+      const { skills, hasLicense } = await scrapeSkillsAndCheckLicenses(detailPage);
 
       // If ANY license tile present → skip job entirely
       if (hasLicense) {
@@ -315,8 +310,8 @@ const script = async () => {
       }
 
       // If company is in ignore list → skip job entirely
-      if (ignore_companies.includes(companyName)) {
-        console.log(`⛔ Skipping "${job.title}" because company "${companyName}" is in ignore list.`);
+      if (ignore_companies.map(c => c.toUpperCase()).includes(job.company.toUpperCase())) {
+        console.log(`⛔ Skipping "${job.title}" because company "${job.company}" is in ignore list.`);
         await detailPage.close();
         continue;
       }
