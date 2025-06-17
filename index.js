@@ -3,14 +3,12 @@ dotenv.config();
 
 import { launch } from 'puppeteer';
 import { Solver } from '@2captcha/captcha-solver';
-import { readFileSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { normalizeUserAgent } from './normalize-ua.js';
 import XLSX from 'xlsx';
 import OpenAI from 'openai';
 
 const solver = new Solver(process.env.APIKEY);
-
-// Initialize OpenAI client pointing at DeepSeek’s base URL
 const openai = new OpenAI({
   baseURL: 'https://api.deepseek.com',
   apiKey: process.env.DEESEEK_API_KEY
@@ -149,35 +147,31 @@ async function classifyDescriptionWithDeepSeek(description, skillsArray) {
     }
   ];
 
-  // 3) Combine the user prompt with both the skills string and the full description
-  const userPrompt = [
-    { role: "user", content: `Skills: ${skillsListStr}\n\nDescription:\n${description}` }
-  ];
+  const userPrompt = [{
+    role: "user",
+    content: `Skills: ${skillsListStr}\n\nDescription:\n${description}`
+  }];
 
-  // 4) Call the deepseek-chat model
-  const response = await openai.chat.completions.create({
+  const resp = await openai.chat.completions.create({
     model: "deepseek-chat",
-    messages: systemPrompt.concat(userPrompt)
+    messages: [...systemPrompt, ...userPrompt]
   });
 
-  // 5) Parse the assistant’s single returned message
-  const content = response.choices[0].message.content.trim().toUpperCase();
-  if (content.includes("PROFILE: JS")) return "JS";
-  if (content.includes("PROFILE: WORDPRESS")) return "WORDPRESS";
-  if (content.includes("PROFILE: PHP")) return "PHP";
+  const out = resp.choices[0].message.content.trim().toUpperCase();
+  if (out.includes("PROFILE: JS")) return "JS";
+  if (out.includes("PROFILE: WORDPRESS")) return "WORDPRESS";
+  if (out.includes("PROFILE: PHP")) return "PHP";
   return "OTHER";
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Main script: combines all phases + new Title‐check logic
-// ──────────────────────────────────────────────────────────────────────────────
-
-const script = async () => {
-  const initialUserAgent = await normalizeUserAgent();
-
+// ————————————————————————————————————————————————————————————————————————
+// Main scraping + cron + Excel de‑dupe
+// ————————————————————————————————————————————————————————————————————————
+async function scrapeIndeed() {
+  const initialUA = await normalizeUserAgent();
   const browser = await launch({
     headless: false,
-    userDataDir: './user_data', // Persist cookies/session
+    userDataDir: './user_data',
     defaultViewport: null,
     args: [
       '--no-sandbox',
@@ -187,194 +181,152 @@ const script = async () => {
       '--disable-infobars',
     ]
   });
-
   const [page] = await browser.pages();
-  const injectFile = readFileSync('./inject.js', 'utf8');
-  await page.evaluateOnNewDocument(injectFile);
+  const injectJS = readFileSync('./inject.js', 'utf8');
+  await page.evaluateOnNewDocument(injectJS);
 
-  // PHASE 1: CAPTCHA solving
-  let captchaSolvedResolve;
-  const captchaSolvedPromise = new Promise(resolve => (captchaSolvedResolve = resolve));
-  let sawCaptcha = false;
-
+  // — Phase 1: CAPTCHA solve
+  let capResolve;
+  const capPromise = new Promise(r => { capResolve = r; });
+  let sawCap = false;
   page.on('console', async msg => {
-    const txt = msg.text();
-    if (txt.startsWith('intercepted-params:')) {
-      sawCaptcha = true;
-      const params = JSON.parse(txt.replace('intercepted-params:', ''));
-      try {
-        const res = await solver.cloudflareTurnstile(params);
-        await page.evaluate(token => cfCallback(token), res.data);
-        captchaSolvedResolve();
-      } catch (e) {
-        console.error("CAPTCHA solve error:", e.err);
-        process.exit(1);
-      }
+    const t = msg.text();
+    if (t.startsWith('intercepted-params:')) {
+      sawCap = true;
+      const p = JSON.parse(t.replace('intercepted-params:', ''));
+      const r = await solver.cloudflareTurnstile(p);
+      await page.evaluate(token => cfCallback(token), r.data);
+      capResolve();
     }
   });
 
-  // PHASE 2: Manual login (run once if needed)
-  const MANUAL_LOGIN_REQUIRED = false;
-  if (MANUAL_LOGIN_REQUIRED) {
+  // — Phase 2: manual login?
+  const MANUAL_LOGIN = false;
+  if (MANUAL_LOGIN) {
     await page.goto('https://www.indeed.com/account/login', { waitUntil: 'domcontentloaded' });
-    console.log('🚨 Please log in manually. You have 60 seconds...');
+    console.log('Please log in manually (60s)…');
     await wait(60000);
     await browser.close();
     return;
   }
 
-  // PHASE 3: Navigate to initial search results
-  await page.goto('https://www.indeed.com/jobs?q=php+developer&l=USA&fromage=1', { waitUntil: 'domcontentloaded' });
-  // If no CAPTCHA, resolve immediately
+  // — Phase 3: Go to search results
+  await page.goto('https://www.indeed.com/jobs?q=php&l=USA&fromage=1', { waitUntil: 'domcontentloaded' });
   await wait(3000);
-  if (!sawCaptcha) captchaSolvedResolve();
-  await captchaSolvedPromise;
-
-  // Allow manual login if any login modal appears
-  console.log('🔐 If login is prompted, please complete within 30s...');
+  if (!sawCap) capResolve();
+  await capPromise;
+  console.log('Complete any login prompt within 30s…');
   await wait(30000);
 
-  // PHASE 4: Scrape, classify (with Title-check + Phase 1.5 + Phase 3), and export
-  const filteredJobs = [];
-  let pageIndex = 1;
+  // — Load existing Excel for de‑dupe
+  const EXCEL = 'indeed_filtered_jobs.xlsx';
+  let existing = [], existingIds = new Set();
+  if (existsSync(EXCEL)) {
+    const wb = XLSX.readFile(EXCEL);
+    const ws = wb.Sheets['FilteredJobs'] || wb.Sheets[wb.SheetNames[0]];
+    existing = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    existing.forEach(r => existingIds.add(r.jobId));
+  }
 
+  const newJobs = [];
+  let pageIdx = 1;
+
+  // — Phase 4: paginate & scrape
   while (true) {
-    // Wait for at least one job card
-    await page.waitForFunction(() => {
-      return document.querySelectorAll('.job_seen_beacon').length > 0;
-    }, { timeout: 60000 });
+    await page.waitForFunction(
+      () => document.querySelectorAll('.job_seen_beacon').length > 0,
+      { timeout: 60000 }
+    );
 
-    // Extract basic info + link for each job on this page
-    const jobs = await page.evaluate(() => {
-      const cards = document.querySelectorAll('.job_seen_beacon');
-      return Array.from(cards).map(card => {
-        const titleElem = card.querySelector('h2.jobTitle > a');
-        const title = titleElem?.innerText || "";
-        const link = titleElem
-          ? "https://www.indeed.com" + titleElem.getAttribute('href')
-          : "";
-        const company = card.querySelector('[data-testid="company-name"]')?.innerText || "";
-        const location = card.querySelector('[data-testid="text-location"]')?.innerText || "";
-        const summary = card.querySelector('.job-snippet')?.innerText.trim() || "";
-        return { title, company, location, summary, link };
+    const cards = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('.job_seen_beacon')).map(c => {
+        // — extract jobId from href jk=…
+        const a = c.querySelector('h2.jobTitle > a');
+        const href = a ? a.getAttribute('href') : '';
+        const url = href.startsWith('http')
+          ? new URL(href)
+          : new URL(href, 'https://www.indeed.com');
+        const jobId = url.searchParams.get('jk') || '';
+        console.log({jobId: jobId});
+        
+        const title = a?.innerText.trim() || '';
+        const link = jobId ? `https://www.indeed.com/viewjob?jk=${jobId}` : '';
+        const company = c.querySelector('[data-testid="company-name"]')?.innerText.trim() || '';
+        const location = c.querySelector('[data-testid="text-location"]')?.innerText.trim() || '';
+        const summary = c.querySelector('.job-snippet')?.innerText.trim() || '';
+
+        return { jobId, title, company, location, summary, link };
       });
     });
 
-    console.log(`📄 Page ${pageIndex}: Found ${jobs.length} jobs.`);
+    console.log(`Page ${pageIdx}: found ${cards.length} jobs`);
 
-    // For each job, open detail page and do:
-    //   A) Title-check → if matches React/JavaScript/PHP/WordPress, assign immediately
-    //   B) Otherwise, PHASE 1.5: skills + license + ignore-company
-    //   C) Then PHASE 3: DeepSeek classification
-    for (const job of jobs) {
-      if (!job.link) continue;
+    for (let job of cards) {
+      if (!job.jobId || existingIds.has(job.jobId)) continue;
 
-      // Convert title to uppercase for easier substring checks
-      const titleUpper = job.title.toUpperCase();
-      let profileFromTitle = null;
+      // — title check
+      const U = job.title.toUpperCase();
+      let profile = null;
+      if (U.includes('REACT') || U.includes('JAVASCRIPT')) profile = 'JS';
+      else if (U.includes('PHP')) profile = 'PHP';
+      else if (U.includes('WORDPRESS')) profile = 'WORDPRESS';
 
-      if (titleUpper.includes("REACT") || titleUpper.includes("JAVASCRIPT")) {
-        profileFromTitle = "JS";
-      } else if (titleUpper.includes("PHP")) {
-        profileFromTitle = "PHP";
-      } else if (titleUpper.includes("WORDPRESS")) {
-        profileFromTitle = "WORDPRESS";
-      }
+      if (!profile) {
+        const d = await browser.newPage();
+        await d.setUserAgent(initialUA);
+        await d.goto(job.link, { waitUntil: 'domcontentloaded' });
 
-      if (profileFromTitle) {
-        // If title gave us an unambiguous family, keep that without DeepSeek
-        filteredJobs.push({
-          title: job.title,
-          company: job.company,
-          location: job.location,
-          summary: job.summary,
-          link: job.link,
-          profile: profileFromTitle
+        const { skills, hasLicense } = await scrapeSkillsAndCheckLicenses(d);
+
+        if (hasLicense ||
+            ignore_companies
+              .map(c => c.toUpperCase())
+              .includes(job.company.toUpperCase())
+        ) {
+          await d.close();
+          continue;
+        }
+
+        await d.waitForSelector('#jobDescriptionText', { timeout: 15000 }).catch(() => {});
+        const desc = await d.evaluate(() => {
+          const e = document.querySelector('#jobDescriptionText');
+          return e ? e.innerText.trim() : '';
         });
-        continue;
+
+        profile = await classifyDescriptionWithDeepSeek(desc, skills);
+        await d.close();
       }
 
-      // If title didn’t match, open detail page for further checks
-      const detailPage = await browser.newPage();
-      await detailPage.setUserAgent(initialUserAgent);
-      await detailPage.goto(job.link, { waitUntil: 'domcontentloaded' });
-
-      // PHASE 1.5a: Scrape skills, licenses, company from detail page
-      const { skills, hasLicense } = await scrapeSkillsAndCheckLicenses(detailPage);
-
-      // If ANY license tile present → skip job entirely
-      if (hasLicense) {
-        console.log(`⛔ Skipping "${job.title}" because license/security requirement found.`);
-        await detailPage.close();
-        continue;
-      }
-
-      // If company is in ignore list → skip job entirely
-      if (ignore_companies.map(c => c.toUpperCase()).includes(job.company.toUpperCase())) {
-        console.log(`⛔ Skipping "${job.title}" because company "${job.company}" is in ignore list.`);
-        await detailPage.close();
-        continue;
-      }
-
-      // PHASE 1.5b: Extract full description from #jobDescriptionText
-      await detailPage.waitForSelector('#jobDescriptionText', { timeout: 15000 }).catch(() => {
-        console.warn('⚠️ Description container not found for', job.link);
-      });
-      const fullDescription = await detailPage.evaluate(() => {
-        const d = document.querySelector('#jobDescriptionText');
-        return d ? d.innerText.trim() : "";
-      });
-
-      // PHASE 3: Classify with DeepSeek using both description + skills array
-      const profile = await classifyDescriptionWithDeepSeek(fullDescription, skills);
-      await detailPage.close();
-
-      filteredJobs.push({
-        title: job.title,
-        company: job.company,
-        location: job.location,
-        summary: job.summary,
-        link: job.link,
-        profile
-      });
+      job.profile = profile || 'OTHER';
+      newJobs.push(job);
+      existingIds.add(job.jobId);
+      console.log(`+ ${job.jobId} → ${job.title} [${job.profile}]`);
     }
 
-    console.log(`✅ After processing page ${pageIndex}, total jobs in list: ${filteredJobs.length}`);
+    // — next?
+    const nxt = await page.$('a[data-testid="pagination-page-next"]');
+    if (!nxt ||
+        await page.evaluate(el => el.getAttribute('aria-disabled') === 'true', nxt)
+    ) break;
 
-    // Pagination: click Next if available
-    const nextBtn = await page.$('a[data-testid="pagination-page-next"]');
-    if (nextBtn) {
-      const disabled = await page.evaluate(el => el.getAttribute('aria-disabled') === 'true', nextBtn);
-      if (disabled) {
-        console.log('⛔ Next button disabled—last page reached.');
-        break;
-      }
-      console.log('⏭ Going to next page...');
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
-        nextBtn.click()
-      ]);
-
-      const newURL = page.url();
-      if (newURL.includes('secure.indeed.com/auth') || newURL.includes('onboarding.indeed.com')) {
-        console.warn('⚠️ Redirected off job listings. Stopping.');
-        break;
-      }
-      pageIndex++;
-    } else {
-      console.log('❌ No Next button—scraping complete.');
-      break;
-    }
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+      nxt.click()
+    ]);
+    pageIdx++;
   }
 
-  // Export all filtered jobs (including OTHER profiles) to Excel
-  const ws = XLSX.utils.json_to_sheet(filteredJobs);
+  // — merge & save
+  const merged = existing.concat(newJobs);
+  const ws = XLSX.utils.json_to_sheet(merged);
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'FilteredJobs');
-  XLSX.writeFile(wb, 'indeed_filtered_jobs.xlsx');
+  XLSX.writeFile(wb, EXCEL);
+  console.log(`✅ Wrote ${merged.length} jobs to ${EXCEL}`);
 
-  console.log(`✅ Finished: ${filteredJobs.length} jobs saved to indeed_filtered_jobs.xlsx`);
   await browser.close();
-};
+}
 
-script();
+// run now + every 20m
+scrapeIndeed();
+// setInterval(scrapeIndeed, 20 * 60 * 1000);
